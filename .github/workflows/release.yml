@@ -5,6 +5,14 @@ on:
     tags:
       - "v*.*.*"
 
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the v prefix, for example 1.1.0"
+        required: true
+        default: "1.1.0"
+        type: string
+
 permissions:
   contents: read
 
@@ -13,43 +21,56 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build and Publish Release
+  validate:
+    name: Validate Release
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
 
-    permissions:
-      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      is-release: ${{ steps.version.outputs.is-release }}
 
     steps:
-      - name: Checkout tagged commit
+      - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: "10.0.x"
-
-      - name: Validate release tag
+      - name: Resolve and validate version
+        id: version
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
 
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "Invalid release tag: $GITHUB_REF_NAME"
-            echo "Expected format: vMAJOR.MINOR.PATCH, for example v1.0.0"
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            TAG="$GITHUB_REF_NAME"
+            IS_RELEASE="true"
+          else
+            TAG="v$INPUT_VERSION"
+            IS_RELEASE="false"
+          fi
+
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Invalid version: $TAG"
+            echo "Expected format: vMAJOR.MINOR.PATCH"
             exit 1
           fi
 
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          VERSION="${TAG#v}"
 
-          echo "Release tag: $GITHUB_REF_NAME"
-          echo "Application version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "is-release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
 
-      - name: Verify tagged commit belongs to main
+          echo "Version: $VERSION"
+          echo "Tag: $TAG"
+          echo "Create release: $IS_RELEASE"
+
+      - name: Verify commit belongs to main
         shell: bash
         run: |
           set -euo pipefail
@@ -57,13 +78,25 @@ jobs:
           git fetch origin main
 
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "The tagged commit is not part of origin/main."
-            echo "Releases must be created from main."
+            echo "The selected commit is not part of origin/main."
+            echo "Releases and release dry runs must use main."
             exit 1
           fi
 
-      - name: Display .NET information
-        run: dotnet --info
+  build-test:
+    name: Build and Test
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.x"
 
       - name: Restore dependencies
         run: dotnet restore
@@ -73,7 +106,7 @@ jobs:
           dotnet build
           --configuration Release
           --no-restore
-          -p:Version=${{ env.VERSION }}
+          -p:Version=${{ needs.validate.outputs.version }}
           -p:ContinuousIntegrationBuild=true
 
       - name: Test
@@ -83,59 +116,211 @@ jobs:
           --no-build
           --verbosity normal
 
-      - name: Publish Windows x64
-        run: >
-          dotnet publish src/CicdDemo/CicdDemo.csproj
-          --configuration Release
-          --runtime win-x64
-          --self-contained true
-          -p:PublishSingleFile=true
-          -p:Version=${{ env.VERSION }}
-          -p:ContinuousIntegrationBuild=true
-          --output artifacts/publish/win-x64
+  publish:
+    name: Publish ${{ matrix.rid }}
+    needs:
+      - validate
+      - build-test
 
-      - name: Package release
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+            package-format: zip
+
+          - os: ubuntu-latest
+            rid: linux-x64
+            package-format: tar
+
+          - os: macos-latest
+            rid: osx-arm64
+            package-format: tar
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      RID: ${{ matrix.rid }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore runtime dependencies
+        run: >
+          dotnet restore
+          src/CicdDemo/CicdDemo.csproj
+          --runtime ${{ matrix.rid }}
+
+      - name: Publish application
+        run: >
+          dotnet publish
+          src/CicdDemo/CicdDemo.csproj
+          --configuration Release
+          --runtime ${{ matrix.rid }}
+          --self-contained true
+          --no-restore
+          -p:PublishSingleFile=true
+          -p:DebugType=None
+          -p:DebugSymbols=false
+          -p:Version=${{ needs.validate.outputs.version }}
+          -p:ContinuousIntegrationBuild=true
+          --output artifacts/publish/${{ matrix.rid }}
+
+      - name: Smoke test Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "./artifacts/publish/$env:RID/CicdDemo.exe" "Matrix $env:RID"
+
+      - name: Smoke test Unix executable
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x "artifacts/publish/$RID/CicdDemo"
+          "artifacts/publish/$RID/CicdDemo" "Matrix $RID"
+
+      - name: Package Windows release
+        if: matrix.package-format == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $publishDirectory = "artifacts/publish/$env:RID"
+          $releaseDirectory = "artifacts/release"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $releaseDirectory | Out-Null
+
+          Copy-Item README.md $publishDirectory
+
+          $archiveName = "CicdDemo-$env:VERSION-$env:RID.zip"
+          $archivePath = Join-Path $releaseDirectory $archiveName
+
+          Compress-Archive `
+            -Path "$publishDirectory/*" `
+            -DestinationPath $archivePath `
+            -Force
+
+          $hash = (
+            Get-FileHash $archivePath -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+
+          "$hash  $archiveName" |
+            Set-Content "$archivePath.sha256" -Encoding ascii
+
+          Get-ChildItem $releaseDirectory
+
+      - name: Package Unix release
+        if: matrix.package-format == 'tar'
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p artifacts/release
+          cp README.md "artifacts/publish/$RID/"
 
-          cp README.md artifacts/publish/win-x64/
+          ARCHIVE="CicdDemo-${VERSION}-${RID}.tar.gz"
 
-          ARCHIVE="$GITHUB_WORKSPACE/artifacts/release/CicdDemo-${VERSION}-win-x64.zip"
-
-          (
-            cd artifacts/publish/win-x64
-            zip -r "$ARCHIVE" .
-          )
+          tar \
+            -czf "artifacts/release/$ARCHIVE" \
+            -C "artifacts/publish/$RID" \
+            .
 
           (
             cd artifacts/release
-            sha256sum "CicdDemo-${VERSION}-win-x64.zip" \
-              > "CicdDemo-${VERSION}-win-x64.zip.sha256"
+            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           )
 
           ls -lah artifacts/release
 
-      - name: Upload workflow artifact
+      - name: Upload platform release
         uses: actions/upload-artifact@v7
         with:
-          name: CicdDemo-${{ github.ref_name }}-win-x64
-          path: artifacts/release/
+          name: release-${{ matrix.rid }}
+          path: artifacts/release/*
           if-no-files-found: error
           retention-days: 30
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
+  release:
+    name: Create GitHub Release
+    needs:
+      - validate
+      - publish
+
+    if: needs.validate.outputs.is-release == 'true'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download platform releases
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: artifacts/release
+          merge-multiple: true
+
+      - name: Display release files
+        shell: bash
+        run: |
+          find artifacts/release \
+            -maxdepth 1 \
+            -type f \
+            -printf "%f\n" \
+            | sort
+
+      - name: Verify SHA-256 checksums
         shell: bash
         run: |
           set -euo pipefail
 
-          gh release create "$GITHUB_REF_NAME" \
-            artifacts/release/*.zip \
-            artifacts/release/*.sha256 \
+          cd artifacts/release
+
+          CHECKSUM_COUNT=0
+
+          for checksum in *.sha256; do
+            sha256sum --check "$checksum"
+            CHECKSUM_COUNT=$((CHECKSUM_COUNT + 1))
+          done
+
+          if [[ "$CHECKSUM_COUNT" -ne 3 ]]; then
+            echo "Expected 3 checksum files, found $CHECKSUM_COUNT."
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create "$RELEASE_TAG" \
+            artifacts/release/* \
             --verify-tag \
-            --title "CicdDemo $GITHUB_REF_NAME" \
+            --title "CicdDemo $RELEASE_TAG" \
             --generate-notes
