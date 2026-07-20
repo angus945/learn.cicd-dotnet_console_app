@@ -34,10 +34,4 @@ public class GreetingTests
         Assert.Equal("name", exception.ParamName);
     }
 
-    [Fact]
-    public void FailTest()
-    {
-        // This test is designed to fail to demonstrate the CI/CD pipeline's failure handling.
-        Assert.True(false, "This test is intentionally failing.");
-    }
 }
