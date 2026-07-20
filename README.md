@@ -32,3 +32,12 @@ tests/CicdDemo.Tests
 ## CI/CD Workflow
 
 GitHub Actions automatically restores dependencies, builds the solution, and runs automated tests for pushes and pull requests targeting main.
+
+## Development Workflow
+
+1. Create a feature branch from `main`.
+2. Make and test changes locally.
+3. Push the feature branch.
+4. Open a pull request targeting `main`.
+5. Wait for CI to pass.
+6. Merge the pull request.
