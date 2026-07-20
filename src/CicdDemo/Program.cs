@@ -1,4 +1,4 @@
-﻿using CicdDemo;
+﻿using CICDDemo;
 
 var name = args.Length > 0 ? args[0] : "CI/CD Learner";
 
